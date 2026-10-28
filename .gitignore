@@ -1,0 +1,42 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Browser profile and session data
+naukri_browser_profile/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyd
+
+# IDE settings
+.idea/
+.vscode/
+
+# Excel job data and generated spreadsheets
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# Logs and diagnostic files
+*.log
+logs/
+*_debug*.png
+*_debug*.html
+*_debug*.txt
+naukri_application_panel_debug.png
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.old
+*_temporary.*
+*_backup_*
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
