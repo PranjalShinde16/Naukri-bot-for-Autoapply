@@ -23,7 +23,7 @@ from playwright.sync_api import (
 BASE_DIR = Path(__file__).resolve().parent
 
 # Main Excel created by your job extractor
-MAIN_EXCEL = BASE_DIR / "naukri_software_jobs_first_page.xlsx"
+MAIN_EXCEL = BASE_DIR / "naukri_job_list.xlsx"
 
 # Separate workbook for jobs that require applying on the company website.
 EXTERNAL_EXCEL = BASE_DIR / "naukri_external_applications.xlsx"

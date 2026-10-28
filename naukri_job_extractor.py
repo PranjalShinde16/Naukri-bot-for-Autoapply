@@ -64,7 +64,7 @@ def scrape_first_page_jobs_to_excel(page):
 
     output_path = (
         Path(__file__).resolve().parent
-        / "naukri_software_jobs_first_page.xlsx"
+        / "naukri_job_list.xlsx"
     )
 
     print(

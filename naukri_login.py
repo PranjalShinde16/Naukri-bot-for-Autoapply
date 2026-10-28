@@ -385,6 +385,7 @@ def select_freshness_last_1_day(page):
 
 def main():
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    scraping_succeeded = False
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -396,7 +397,7 @@ def main():
         page = context.pages[0] if context.pages else context.new_page()
 
         try:
-            print("\n=== Naukri Automation Bot ===", flush=True)
+            print("\\n=== Naukri Automation Bot ===", flush=True)
 
             page.goto(
                 HOME_URL,
@@ -415,10 +416,8 @@ def main():
             select_freshness_last_1_day(page)
             scrape_first_page_jobs_to_excel(page)
 
-            input(
-                "\nVerify the applied salary filters in the browser. "
-                "Press Enter to close..."
-            )
+            scraping_succeeded = True
+            print("\\nScraping completed successfully.", flush=True)
 
         except Exception as error:
             print(
@@ -427,8 +426,23 @@ def main():
             )
             input("Inspect the browser, then press Enter to close...")
         finally:
+            # The processor uses this same persistent profile. Close the
+            # scraping context first so the profile is not open twice.
             context.close()
             print("Browser closed; persistent profile retained.", flush=True)
+
+    if scraping_succeeded:
+        print(
+            "\\nStarting the application processor automatically...",
+            flush=True,
+        )
+        from naukri_application_processor import main as process_applications
+        process_applications()
+    else:
+        print(
+            "Scraping did not complete. The application processor was not started.",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
