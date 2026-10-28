@@ -15,6 +15,7 @@ EXCLUDED_COMPANIES = {
     "wipro",
     "cgi",
     "cognizant",
+    "epam systems",
     "infosys bpm",
 }
 
