@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from datetime import datetime
@@ -27,6 +28,10 @@ MAIN_EXCEL = BASE_DIR / "naukri_job_list.xlsx"
 
 # Separate workbook for jobs that require applying on the company website.
 EXTERNAL_EXCEL = BASE_DIR / "naukri_external_applications.xlsx"
+
+# Durable record of confirmed application outcomes whose Excel row cleanup failed.
+# This prevents the same confirmed application from being submitted again on a later run.
+CONFIRMED_OUTCOMES_FILE = BASE_DIR / "naukri_confirmed_outcomes.json"
 
 # Use your existing Naukri profile/session
 PROFILE_DIR = BASE_DIR / "naukri_browser_profile"
@@ -391,32 +396,37 @@ def remove_job_from_main_excel(job_url: str) -> bool:
         for row_number in reversed(orphan_rows):
             worksheet.delete_rows(row_number, 1)
 
-        # openpyxl does not reliably shift hyperlink relationship references
-        # when worksheet rows are deleted. Rebuild each Job URL hyperlink from
-        # the displayed cell value to keep every link aligned with its row.
-        repaired_links = 0
+        # openpyxl does not reliably shift hyperlink relationships when rows
+        # are deleted. Do not trust the old hyperlink object, even if its target
+        # looks correct in memory: clear every URL-column hyperlink and rebuild
+        # it from that row's displayed URL value before saving.
+        rebuilt_links = 0
         cleared_links = 0
         for row_number in range(2, worksheet.max_row + 1):
             url_cell = worksheet.cell(row_number, url_col)
             url_value = normalize_text(url_cell.value)
-            current_target = normalize_text(
-                url_cell.hyperlink.target if url_cell.hyperlink else ""
-            )
 
+            # Explicitly clear the underlying hyperlink object first. This also
+            # discards stale relationship IDs left behind by row deletion.
+            url_cell._hyperlink = None
             if not url_value:
-                if url_cell.hyperlink:
-                    url_cell.hyperlink = None
-                    cleared_links += 1
+                cleared_links += 1
                 continue
 
-            if is_valid_http_url(url_value) and current_target != url_value:
-                url_cell.hyperlink = url_value
-                repaired_links += 1
+            if is_valid_http_url(url_value):
+                from openpyxl.worksheet.hyperlink import Hyperlink
+                url_cell._hyperlink = Hyperlink(
+                    ref=url_cell.coordinate,
+                    target=url_value,
+                    display=url_value,
+                )
+                rebuilt_links += 1
 
         log(
             f"[EXCEL-REMOVE] Deleted {len(matching_rows)} matching row(s) "
             f"and {len(orphan_rows)} orphan row(s). "
-            f"Repaired {repaired_links} hyperlink(s); cleared {cleared_links}."
+            f"Rebuilt {rebuilt_links} URL hyperlink(s) from cell values; "
+            f"cleared {cleared_links} blank URL cell(s)."
         )
 
         _refresh_excel_table_ranges(worksheet)
@@ -729,6 +739,189 @@ def dump_button_diagnostics(page: Page, reason: str) -> None:
         log(f"Could not save DOM screenshot: {exc}")
 
     log("----- END BUTTON DETECTION DIAGNOSTICS -----")
+
+def get_keyskills_green_status(page: Page) -> Optional[bool]:
+    """Inspect and log the Keyskills match indicator before any application action.
+
+    Returns True for green, False for a confidently found non-green indicator,
+    and None when the indicator cannot be identified confidently. Diagnostic
+    details are written to naukri_processor_debug.log to make DOM changes easier
+    to investigate without changing the conservative application policy.
+    """
+    try:
+        try:
+            page_title = page.title()
+        except Exception as title_exc:
+            page_title = f"<title unavailable: {title_exc}>"
+        log(
+            f"[KEYSKILLS] Starting detection on URL={page.url!r}; "
+            f"page_title={page_title!r}"
+        )
+
+        result = page.locator("body").evaluate(
+            r"""body => {
+                const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const visible = el => {
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return s && s.display !== 'none' && s.visibility !== 'hidden' &&
+                           Number(s.opacity || 1) > 0 && r.width > 0 && r.height > 0;
+                };
+                const colorInfo = el => {
+                    const st = window.getComputedStyle(el);
+                    return {
+                        color: st.color,
+                        backgroundColor: st.backgroundColor,
+                        fill: st.fill,
+                        stroke: st.stroke,
+                        borderColor: st.borderColor
+                    };
+                };
+                const isGreenColor = value => {
+                    if (!value) return false;
+                    const v = value.toLowerCase();
+                    if (/green|success|text-green|bg-green/i.test(v)) return true;
+                    const hex = v.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+                    if (hex) {
+                        let h = hex[1];
+                        if (h.length === 3) h = h.split('').map(c => c + c).join('');
+                        const r = parseInt(h.slice(0, 2), 16);
+                        const g = parseInt(h.slice(2, 4), 16);
+                        const b = parseInt(h.slice(4, 6), 16);
+                        return g >= 100 && g > r * 1.18 && g > b * 1.08;
+                    }
+                    const m = v.match(/rgba?\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+                    if (!m) return false;
+                    const r = Number(m[1]), g = Number(m[2]), b = Number(m[3]);
+                    return g >= 100 && g > r * 1.18 && g > b * 1.08;
+                };
+                const isGreenElement = el => {
+                    const cls = typeof el.className === 'string' ? el.className :
+                        (el.className && el.className.baseVal) || '';
+                    const attrs = [cls, el.getAttribute('style') || '', el.getAttribute('aria-label') || '',
+                                   el.getAttribute('title') || '', el.getAttribute('data-testid') || '',
+                                   el.getAttribute('fill') || '', el.getAttribute('stroke') || ''].join(' ');
+                    if (/green|success|text-green|bg-green|check-circle/i.test(attrs)) return true;
+                    const colors = colorInfo(el);
+                    return isGreenColor(colors.color) || isGreenColor(colors.backgroundColor) ||
+                           isGreenColor(colors.fill) || isGreenColor(colors.stroke) ||
+                           isGreenColor(el.getAttribute('fill')) || isGreenColor(el.getAttribute('stroke'));
+                };
+                const describe = el => {
+                    const cls = typeof el.className === 'string' ? el.className :
+                        (el.className && el.className.baseVal) || '';
+                    return {
+                        tag: el.tagName,
+                        text: norm(el.innerText || el.textContent).slice(0, 100),
+                        className: String(cls).slice(0, 220),
+                        ariaLabel: el.getAttribute('aria-label') || '',
+                        title: el.getAttribute('title') || '',
+                        testId: el.getAttribute('data-testid') || '',
+                        colors: colorInfo(el),
+                        outerHTML: (el.outerHTML || '').slice(0, 900)
+                    };
+                };
+
+                const labels = Array.from(body.querySelectorAll('body *')).filter(el =>
+                    visible(el) && el.children.length === 0 && norm(el.textContent) === 'keyskills'
+                );
+                const diagnostics = {
+                    labelCount: labels.length,
+                    labels: [],
+                    inspectedItems: [],
+                    visibleTextHasJobMatchScore: norm(body.innerText).includes('job match score')
+                };
+                if (!labels.length) {
+                    return {status: 'unknown', reason: 'Keyskills label not found', diagnostics};
+                }
+
+                for (const label of labels.slice(0, 5)) {
+                    const labelInfo = describe(label);
+                    let node = label;
+                    const ancestors = [];
+                    for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+                        const nodeText = norm(node.innerText || node.textContent);
+                        ancestors.push(describe(node));
+                        // Restrict inspection to the small Keyskills label item.
+                        // Do not inspect the whole score card, where other green checks exist.
+                        if (!nodeText.includes('keyskills') || nodeText.length > 80) continue;
+                        const candidates = [node, ...Array.from(node.querySelectorAll('svg, path, i, span, div'))].slice(0, 30);
+                        const greenCandidates = candidates.filter(isGreenElement);
+                        diagnostics.inspectedItems.push({
+                            item: describe(node),
+                            candidateCount: candidates.length,
+                            greenCandidateCount: greenCandidates.length,
+                            candidates: candidates.slice(0, 15).map(describe)
+                        });
+                        if (greenCandidates.length) {
+                            diagnostics.labels.push({label: labelInfo, ancestors});
+                            return {
+                                status: 'green',
+                                reason: 'green indicator found in the Keyskills label item',
+                                diagnostics
+                            };
+                        }
+                    }
+                    diagnostics.labels.push({label: labelInfo, ancestors});
+                }
+                return {
+                    status: 'not_green',
+                    reason: 'Keyskills label found but no green indicator found nearby',
+                    diagnostics
+                };
+            }"""
+        )
+        status = (result or {}).get("status")
+        reason = (result or {}).get("reason", "")
+        diagnostics = (result or {}).get("diagnostics", {})
+        log(
+            f"[KEYSKILLS] Detection result: status={status!r}; reason={reason}; "
+            f"label_count={diagnostics.get('labelCount', 'n/a')}; "
+            f"job_match_score_text_found={diagnostics.get('visibleTextHasJobMatchScore', 'n/a')}"
+        )
+
+        # Log DOM evidence in a readable form. Truncate the number of entries so
+        # a changed page layout does not create an excessively large log.
+        for label_info in diagnostics.get("labels", [])[:3]:
+            log(f"[KEYSKILLS][DIAGNOSTIC] Label/ancestor evidence: {json.dumps(label_info, ensure_ascii=False)}")
+        for item_info in diagnostics.get("inspectedItems", [])[:5]:
+            log(f"[KEYSKILLS][DIAGNOSTIC] Inspected Keyskills item: {json.dumps(item_info, ensure_ascii=False)}")
+
+        if status == "green":
+            log("[KEYSKILLS] PASS: indicator detected as green; job is eligible for the existing application flow.")
+            return True
+        if status == "not_green":
+            log("[KEYSKILLS] FAIL-CLOSED: Keyskills label found, but no green indicator was detected; job will be skipped.")
+            return False
+
+        log("[KEYSKILLS] UNKNOWN: unable to identify the Keyskills label; no application action will be taken.")
+        # Preserve diagnostic artifacts only when detection is unknown, so the
+        # next run can be compared against the actual page layout.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            dom_path = BASE_DIR / f"naukri_keyskills_unknown_{timestamp}.html"
+            dom_path.write_text(page.content(), encoding="utf-8")
+            log(f"[KEYSKILLS] Unknown-state DOM saved to: {dom_path.name}")
+        except Exception as artifact_exc:
+            log(f"[KEYSKILLS] Could not save unknown-state DOM: {artifact_exc}")
+        try:
+            screenshot_path = BASE_DIR / f"naukri_keyskills_unknown_{timestamp}.png"
+            page.screenshot(path=str(screenshot_path), full_page=True)
+            log(f"[KEYSKILLS] Unknown-state screenshot saved to: {screenshot_path.name}")
+        except Exception as artifact_exc:
+            log(f"[KEYSKILLS] Could not save unknown-state screenshot: {artifact_exc}")
+        return None
+    except Exception as exc:
+        log(f"[KEYSKILLS] ERROR while inspecting indicator: {type(exc).__name__}: {exc}")
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dom_path = BASE_DIR / f"naukri_keyskills_error_{timestamp}.html"
+            dom_path.write_text(page.content(), encoding="utf-8")
+            log(f"[KEYSKILLS] Error-state DOM saved to: {dom_path.name}")
+        except Exception as artifact_exc:
+            log(f"[KEYSKILLS] Could not save error-state DOM: {artifact_exc}")
+        return None
+
 
 def find_applied_state(page: Page) -> bool:
     """
@@ -1336,6 +1529,25 @@ def process_one_job(
             log("This job already shows 'Applied'.")
             return "APPLIED_ALREADY"
 
+        # Check the Keyskills match indicator before any application action.
+        # A non-green indicator means this job is discarded without applying
+        # or saving an external application URL. Unknown detection is fail-safe.
+        keyskills_green = get_keyskills_green_status(page)
+        if keyskills_green is False:
+            log(
+                "Keyskills match indicator is NOT green. "
+                "Skipping application and removing this job from the main Excel."
+            )
+            return "KEYSKILLS_NOT_GREEN"
+        if keyskills_green is None:
+            log(
+                "WARNING: Could not confidently determine the Keyskills indicator color. "
+                "No application action will be taken; keeping the job for review."
+            )
+            return "KEEP"
+
+        log("Keyskills match indicator is green; eligible to continue.")
+
         # Case 2: Apply on company site
         external_url = find_external_apply_link(page)
 
@@ -1476,6 +1688,49 @@ def process_one_job(
 
 
 # ============================================================
+# CONFIRMED-OUTCOME LEDGER
+# ============================================================
+
+def load_confirmed_outcomes() -> dict[str, str]:
+    """Load confirmed applications awaiting successful Excel row cleanup."""
+    if not CONFIRMED_OUTCOMES_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(CONFIRMED_OUTCOMES_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("Expected a JSON object")
+        return {
+            normalize_text(url): normalize_text(outcome)
+            for url, outcome in raw.items()
+            if normalize_text(url) and normalize_text(outcome)
+        }
+    except Exception as exc:
+        log(f"WARNING: Could not read confirmed-outcome ledger: {exc}. "
+            "No ledger entries will be assumed.")
+        return {}
+
+
+def save_confirmed_outcomes(outcomes: dict[str, str]) -> bool:
+    """Atomically persist confirmed outcomes so failed cleanup never triggers reapplication."""
+    temporary_path = CONFIRMED_OUTCOMES_FILE.with_suffix(".json.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(outcomes, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary_path.replace(CONFIRMED_OUTCOMES_FILE)
+        return True
+    except Exception as exc:
+        log(f"ERROR: Could not persist confirmed-outcome ledger: {exc}")
+        try:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        except Exception:
+            pass
+        return False
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1520,6 +1775,12 @@ def main() -> None:
         return
 
     log(f"Found {len(jobs)} job(s) in the main Excel.")
+    confirmed_outcomes = load_confirmed_outcomes()
+    if confirmed_outcomes:
+        log(
+            f"Loaded {len(confirmed_outcomes)} confirmed application(s) "
+            "awaiting Excel cleanup; these will NOT be applied again."
+        )
     log(
         "IMPORTANT: Close other Chrome/Playwright instances that are "
         "using this same profile before starting the script."
@@ -1530,6 +1791,8 @@ def main() -> None:
     cleanup_failure_count = 0
     failed_count = 0
     kept_count = 0
+    keyskills_skipped_count = 0
+    keyskills_skip_cleanup_failures = 0
 
     try:
         with sync_playwright() as playwright:
@@ -1561,7 +1824,43 @@ def main() -> None:
                 log("")
                 log(f"Processing job {index} of {len(jobs)}")
 
+                saved_outcome = confirmed_outcomes.get(job["url"])
+                if saved_outcome:
+                    log(
+                        "This URL already has a confirmed application outcome "
+                        f"({saved_outcome}) from a previous run. Retrying Excel cleanup "
+                        "only; the application flow will not be opened again."
+                    )
+                    removed = remove_job_from_main_excel(job["url"])
+                    if removed:
+                        completed_count += 1
+                        confirmed_outcomes.pop(job["url"], None)
+                        save_confirmed_outcomes(confirmed_outcomes)
+                        log("SUCCESS: Previously confirmed application row cleanup is now verified.")
+                    else:
+                        cleanup_failure_count += 1
+                        log("WARNING: Excel cleanup still failed. Confirmed outcome remains "
+                            "in the ledger for a cleanup-only retry on the next run.")
+                    continue
+
                 outcome = process_one_job(context, job)
+
+                if outcome == "KEYSKILLS_NOT_GREEN":
+                    keyskills_skipped_count += 1
+                    removed = remove_job_from_main_excel(job["url"])
+                    if removed:
+                        log(
+                            "SKIPPED: Keyskills was not green. Job row removed from the main Excel; "
+                            "no application was submitted and no external URL was saved."
+                        )
+                    else:
+                        keyskills_skip_cleanup_failures += 1
+                        log(
+                            "WARNING: Keyskills was not green, so no application was submitted, "
+                            "but removing the job row from Excel failed. It remains for cleanup."
+                        )
+                    time.sleep(1.5)
+                    continue
 
                 if outcome in {
                     "EXTERNAL_APPLICATION",
@@ -1576,20 +1875,33 @@ def main() -> None:
                     else:
                         log(f"Application outcome confirmed: {outcome}")
 
+                    # Persist the confirmed outcome before touching the main workbook.
+                    # If cleanup fails or the process stops, the next run retries cleanup
+                    # only instead of submitting the application a second time.
+                    confirmed_outcomes[job["url"]] = outcome
+                    ledger_saved = save_confirmed_outcomes(confirmed_outcomes)
+                    if not ledger_saved:
+                        log(
+                            "WARNING: Could not persist the confirmed-outcome ledger. "
+                            "Excel cleanup will still be attempted, but duplicate-application "
+                            "protection cannot be guaranteed if cleanup also fails."
+                        )
+
                     removed = remove_job_from_main_excel(job["url"])
                     if removed:
                         completed_count += 1
+                        confirmed_outcomes.pop(job["url"], None)
+                        save_confirmed_outcomes(confirmed_outcomes)
                         log(
                             "SUCCESS: Application outcome confirmed and main Excel "
                             "row cleanup verified."
                         )
                     else:
-                        failed_count += 1
                         cleanup_failure_count += 1
                         log(
-                            "FAILED: Application outcome was confirmed, but deleting "
-                            "the job row / verifying Excel cleanup failed. This job "
-                            "is counted as failed and its row may remain for review."
+                            "WARNING: Application outcome is confirmed, but Excel cleanup "
+                            "failed. This remains an application success; the URL is recorded "
+                            "for cleanup-only retry and will not be applied again."
                         )
 
                 else:
@@ -1606,11 +1918,13 @@ def main() -> None:
             log("=" * 70)
             log("PROCESSING SUMMARY")
             log("=" * 70)
-            log(f"Jobs successfully processed (application + Excel cleanup): {completed_count}")
+            log(f"Confirmed application outcomes with row cleanup verified: {completed_count}")
             log(f"External application URLs saved: {external_saved_count}")
-            log(f"Jobs failed because Excel cleanup failed: {failed_count}")
+            log(f"Jobs skipped because Keyskills was not green: {keyskills_skipped_count}")
+            log(f"Keyskills-skip Excel cleanup failures: {keyskills_skip_cleanup_failures}")
             log(f"Jobs kept for review/retry (application not confirmed): {kept_count}")
-            log(f"Excel cleanup failures: {cleanup_failure_count}")
+            log(f"Excel cleanup failures (application outcome remains confirmed): {cleanup_failure_count}")
+            log(f"Confirmed outcomes awaiting cleanup retry: {len(confirmed_outcomes)}")
             log(f"Jobs originally loaded: {len(jobs)}")
             log(f"Main Excel: {MAIN_EXCEL}")
             log(f"External applications Excel: {EXTERNAL_EXCEL}")
