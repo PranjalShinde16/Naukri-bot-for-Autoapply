@@ -44,6 +44,39 @@ SALARY_RANGES = [
 ]
 
 
+def preserve_search_filters(current_url: str, next_url: str) -> str:
+    """Carry active query filters when Naukri's Next href omits the query."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    current = urlsplit(current_url)
+    target = urlsplit(next_url)
+    current_params = parse_qsl(current.query, keep_blank_values=True)
+    target_params = parse_qsl(target.query, keep_blank_values=True)
+    target_keys = {key for key, _ in target_params}
+    merged_params = list(target_params)
+    for key, value in current_params:
+        if key not in target_keys:
+            merged_params.append((key, value))
+    return urlunsplit((target.scheme or current.scheme, target.netloc or current.netloc,
+                       target.path, urlencode(merged_params, doseq=True), target.fragment))
+
+
+def verify_search_filters_in_url(url: str) -> tuple[bool, list[str]]:
+    """Fail closed unless freshness and all configured salary filters remain."""
+    from urllib.parse import urlsplit, parse_qsl
+    params = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+    param_map = {}
+    for key, value in params:
+        param_map.setdefault(key, []).append(value)
+    problems = []
+    if "1" not in param_map.get("jobAge", []):
+        problems.append("jobAge=1 (Freshness: Last 1 day) is missing")
+    expected_salary = {"15to25", "25to50", "50to75", "75to100", "100to500", "501", "10to15"}
+    missing_salary = expected_salary - set(param_map.get("ctcFilter", []))
+    if missing_salary:
+        problems.append("salary filter(s) missing: " + ", ".join(sorted(missing_salary)))
+    return not problems, problems
+
+
 def visible(locator):
     try:
         return locator.is_visible()
@@ -458,10 +491,14 @@ def get_next_results_page_url(page):
                         "(href) => new URL(href, location.origin).href", href
                     )
                     if absolute != current_url:
-                        pagination_log(
-                            f"[PAGINATION][NEXT] Found next-page href: {absolute}"
-                        )
-                        return absolute
+                        filtered_url = preserve_search_filters(current_url, absolute)
+                        ok, problems = verify_search_filters_in_url(filtered_url)
+                        if not ok:
+                            pagination_log("[PAGINATION][NEXT][ERROR] Refusing unfiltered URL: " + "; ".join(problems))
+                            continue
+                        pagination_log(f"[PAGINATION][NEXT] Found next-page href: {absolute}")
+                        pagination_log(f"[PAGINATION][NEXT] Preserved active search filters: {filtered_url}")
+                        return filtered_url
         except Exception as exc:
             pagination_log(
                 f"[PAGINATION][NEXT][DEBUG] Selector {selector!r} failed: "
@@ -512,7 +549,12 @@ def get_next_results_page_url(page):
                     f"first_job={first_job_href(page)!r}"
                 )
                 if new_url != old_url:
-                    return new_url
+                    filtered_url = preserve_search_filters(old_url, new_url)
+                    ok, problems = verify_search_filters_in_url(filtered_url)
+                    if not ok:
+                        pagination_log("[PAGINATION][NEXT][ERROR] Filter verification failed: " + "; ".join(problems))
+                        return None
+                    return filtered_url
                 pagination_log(
                     "[PAGINATION][NEXT][ERROR] Results changed but URL did not. "
                     "Cannot safely resume this page after processor hand-off."
@@ -580,7 +622,10 @@ def main():
             select_salary_ranges(page)
             select_freshness_last_1_day(page)
             first_page_setup_complete = True
-            pagination_log(f"[FILTERS] Search and filters configured. Results URL={page.url}")
+            filters_ok, filter_problems = verify_search_filters_in_url(page.url)
+            if not filters_ok:
+                raise RuntimeError("Initial filters could not be verified: " + "; ".join(filter_problems) + ". Refusing to scrape unfiltered results.")
+            pagination_log(f"[FILTERS] Search and filters configured and URL-verified. Results URL={page.url}")
 
             while True:
                 current_url = page.url
@@ -692,11 +737,15 @@ def main():
                 context, page = launch_scraping_context(p)
                 page.goto(next_url, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(1500)
-                pagination_log(
-                    f"[PAGINATION] Page {page_number} loaded: {page.url}"
-                )
-                # Reapply no filters here: the next URL should preserve the
-                # already configured search/filter state.
+                loaded_ok, loaded_problems = verify_search_filters_in_url(page.url)
+                if not loaded_ok:
+                    pagination_log("[PAGINATION][FILTERS][WARNING] Loaded URL lost filters: " + "; ".join(loaded_problems) + ". Retrying filtered URL.")
+                    page.goto(next_url, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(1500)
+                    loaded_ok, loaded_problems = verify_search_filters_in_url(page.url)
+                if not loaded_ok:
+                    raise RuntimeError(f"Page {page_number} loaded without required filters: " + "; ".join(loaded_problems) + ". Stopping before scraping irrelevant jobs.")
+                pagination_log(f"[PAGINATION] Page {page_number} loaded with filters verified: {page.url}")
         except KeyboardInterrupt:
             pagination_log("[STOP] Keyboard interrupt received. Stopping safely.")
         except Exception as error:
