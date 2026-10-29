@@ -373,10 +373,18 @@ def remove_job_from_main_excel(job_url: str) -> bool:
             hyperlink_target = normalize_text(
                 url_cell.hyperlink.target if url_cell.hyperlink else ""
             )
-            if not company and not title and (url_value or hyperlink_target):
+            row_has_content = any(
+                normalize_text(worksheet.cell(row_number, column).value)
+                for column in range(1, worksheet.max_column + 1)
+            ) or bool(url_cell.hyperlink)
+
+            # User rule: if BOTH identifying fields are blank, the row is useless.
+            # Remove any populated stale row, not only rows containing a URL.
+            if row_has_content and not company and not title:
                 orphan_rows.append(row_number)
                 log(
-                    f"[EXCEL-REMOVE] Removing stale orphan row {row_number}: "
+                    f"[EXCEL-REMOVE] Removing stale row {row_number}: "
+                    f"Company Name and Job Title are both blank; "
                     f"url_value={url_value!r}; hyperlink_target={hyperlink_target!r}"
                 )
 
@@ -1518,7 +1526,9 @@ def main() -> None:
     )
 
     completed_count = 0
-    skipped_count = 0
+    external_saved_count = 0
+    cleanup_failure_count = 0
+    failed_count = 0
     kept_count = 0
 
     try:
@@ -1560,29 +1570,33 @@ def main() -> None:
                 }:
                     # For external applications, the separate workbook is saved
                     # inside process_one_job before this removal is attempted.
+                    if outcome == "EXTERNAL_APPLICATION":
+                        external_saved_count += 1
+                        log("External application URL was saved to the separate workbook.")
+                    else:
+                        log(f"Application outcome confirmed: {outcome}")
+
                     removed = remove_job_from_main_excel(job["url"])
                     if removed:
                         completed_count += 1
-                        if outcome == "EXTERNAL_APPLICATION":
-                            log(
-                                "External application saved to the separate workbook "
-                                "and its row removed from the main Excel."
-                            )
-                        else:
-                            log(f"Job processed successfully: {outcome}")
-                    else:
-                        kept_count += 1
                         log(
-                            "Outcome was detected, but the main Excel row could not "
-                            "be removed safely. The external URL, if applicable, "
-                            "remains saved in the separate workbook."
+                            "SUCCESS: Application outcome confirmed and main Excel "
+                            "row cleanup verified."
+                        )
+                    else:
+                        failed_count += 1
+                        cleanup_failure_count += 1
+                        log(
+                            "FAILED: Application outcome was confirmed, but deleting "
+                            "the job row / verifying Excel cleanup failed. This job "
+                            "is counted as failed and its row may remain for review."
                         )
 
                 else:
                     kept_count += 1
                     log(
                         "Job not confirmed as successfully processed. "
-                        "Its row will remain in the main Excel."
+                        "Its row will remain in the main Excel for review/retry."
                     )
 
                 # Small delay between jobs to avoid rapid navigation.
@@ -1592,8 +1606,11 @@ def main() -> None:
             log("=" * 70)
             log("PROCESSING SUMMARY")
             log("=" * 70)
-            log(f"Jobs successfully processed: {completed_count}")
-            log(f"Jobs kept for review/retry: {kept_count}")
+            log(f"Jobs successfully processed (application + Excel cleanup): {completed_count}")
+            log(f"External application URLs saved: {external_saved_count}")
+            log(f"Jobs failed because Excel cleanup failed: {failed_count}")
+            log(f"Jobs kept for review/retry (application not confirmed): {kept_count}")
+            log(f"Excel cleanup failures: {cleanup_failure_count}")
             log(f"Jobs originally loaded: {len(jobs)}")
             log(f"Main Excel: {MAIN_EXCEL}")
             log(f"External applications Excel: {EXTERNAL_EXCEL}")
