@@ -1044,6 +1044,8 @@ def find_external_apply_link(page: Page) -> Optional[str]:
             pass
         popup_url = popup_page.url
         log(f"Captured external application popup URL: {popup_url}")
+        # Give Naukri a few seconds to register the external link opening.
+        page.wait_for_timeout(3000)
         if is_valid_http_url(popup_url) and popup_url != original_url:
             try:
                 popup_page.close()
