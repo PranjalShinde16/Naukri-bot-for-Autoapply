@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1734,7 +1736,7 @@ def save_confirmed_outcomes(outcomes: dict[str, str]) -> bool:
 # MAIN
 # ============================================================
 
-def main() -> None:
+def main(job_urls: Optional[set[str]] = None, wait_for_enter: bool = True) -> None:
     log("Starting Naukri application processor...")
     log(f"[STARTUP] Running script: {Path(__file__).resolve()}")
     log(f"[STARTUP] Debug log: {(BASE_DIR / 'naukri_processor_debug.log').resolve()}")
@@ -1770,11 +1772,21 @@ def main() -> None:
         log(f"ERROR reading main Excel: {exc}")
         return
 
+    if job_urls is not None:
+        requested_urls = {normalize_text(url) for url in job_urls if normalize_text(url)}
+        jobs = [job for job in jobs if normalize_text(job.get("url")) in requested_urls]
+        log(
+            f"[BATCH] Page-scoped processing enabled: requested_urls={len(requested_urls)}, "
+            f"matching_excel_jobs={len(jobs)}"
+        )
+    else:
+        log("[BATCH] No URL filter supplied; processing all jobs currently in the main Excel.")
+
     if not jobs:
-        log("No jobs found in the main Excel. Nothing to process.")
+        log("No matching jobs found in the main Excel for this batch. Nothing to process.")
         return
 
-    log(f"Found {len(jobs)} job(s) in the main Excel.")
+    log(f"Found {len(jobs)} job(s) to process in this batch.")
     confirmed_outcomes = load_confirmed_outcomes()
     if confirmed_outcomes:
         log(
@@ -1930,10 +1942,11 @@ def main() -> None:
             log(f"External applications Excel: {EXTERNAL_EXCEL}")
             log("=" * 70)
 
-            input(
-                "\nProcessing finished. Press Enter to close the "
-                "automation browser, or Ctrl+C to stop."
-            )
+            if wait_for_enter:
+                input(
+                    "\nProcessing finished. Press Enter to close the "
+                    "automation browser, or Ctrl+C to stop."
+                )
 
             # Closing the persistent context closes its browser window.
             # The original tab was never navigated by this script.
@@ -1941,6 +1954,10 @@ def main() -> None:
 
     except KeyboardInterrupt:
         log("Stopped by user.")
+        # When orchestrated by naukri_login.py, propagate Ctrl+C so the
+        # page-by-page loop stops instead of starting the next page.
+        if not wait_for_enter:
+            raise
 
     except Exception as exc:
         log(f"FATAL ERROR: {exc}")
@@ -1948,7 +1965,32 @@ def main() -> None:
             "If the browser profile is already in use, close the other "
             "browser instance and try again."
         )
+        if not wait_for_enter:
+            raise
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Process Naukri job applications.")
+    parser.add_argument(
+        "--batch-file",
+        type=Path,
+        help="JSON file containing a list of Job URLs to process in this batch.",
+    )
+    args = parser.parse_args()
+
+    batch_urls = None
+    if args.batch_file:
+        try:
+            payload = json.loads(args.batch_file.read_text(encoding="utf-8"))
+            if not isinstance(payload, list) or not all(isinstance(item, str) for item in payload):
+                raise ValueError("Batch file must contain a JSON list of URL strings.")
+            batch_urls = set(payload)
+        except Exception as exc:
+            log(f"FATAL ERROR: Could not read batch file {args.batch_file}: {exc}")
+            sys.exit(2)
+
+    try:
+        main(job_urls=batch_urls, wait_for_enter=False if args.batch_file else True)
+    except KeyboardInterrupt:
+        log("Stopped by user.")
+        sys.exit(130)
