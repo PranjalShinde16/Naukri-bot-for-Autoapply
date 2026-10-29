@@ -44,37 +44,139 @@ SALARY_RANGES = [
 ]
 
 
-def preserve_search_filters(current_url: str, next_url: str) -> str:
-    """Carry active query filters when Naukri's Next href omits the query."""
+def ensure_required_search_filters(url: str) -> str:
+    """
+    Ensure every results-page URL contains all required salary, freshness,
+    and additional filters while preserving pagination and unrelated parameters.
+    """
     from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
+    parts = urlsplit(url)
+    params = parse_qsl(parts.query, keep_blank_values=True)
+
+    # These filter keys are managed explicitly. Rebuild them to avoid missing
+    # repeated values or retaining conflicting values from a Next-page href.
+    managed_keys = {
+        "jobAge",
+        "ctcFilter",
+        "glbl_qcrc",
+        "experience",
+        "jobPostType",
+    }
+    params = [(key, value) for key, value in params if key not in managed_keys]
+
+    # Preserve all seven salary ranges and the Last 1 day freshness filter.
+    params.append(("jobAge", "1"))
+    for value in (
+        "15to25",
+        "25to50",
+        "50to75",
+        "75to100",
+        "100to500",
+        "501",
+        "10to15",
+    ):
+        params.append(("ctcFilter", value))
+
+    # glbl_qcrc is intentionally repeated: Naukri expects one parameter per value.
+    for value in ("1026", "1028", "1060"):
+        params.append(("glbl_qcrc", value))
+
+    params.extend([("experience", "4"), ("jobPostType", "1")])
+
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(params, doseq=True),
+        parts.fragment,
+    ))
+
+
+def preserve_search_filters(current_url: str, next_url: str) -> str:
+    """
+    Preserve page-specific parameters from the Next URL, then explicitly
+    restore all configured filters, including repeated ctcFilter/glbl_qcrc values.
+    """
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
     current = urlsplit(current_url)
     target = urlsplit(next_url)
     current_params = parse_qsl(current.query, keep_blank_values=True)
     target_params = parse_qsl(target.query, keep_blank_values=True)
+
+    # Keep the target page's pagination parameters. Add current parameters only
+    # when the target does not already contain that key; required filters are
+    # rebuilt below so repeated values cannot be accidentally dropped.
     target_keys = {key for key, _ in target_params}
     merged_params = list(target_params)
     for key, value in current_params:
         if key not in target_keys:
             merged_params.append((key, value))
-    return urlunsplit((target.scheme or current.scheme, target.netloc or current.netloc,
-                       target.path, urlencode(merged_params, doseq=True), target.fragment))
+
+    merged_url = urlunsplit((
+        target.scheme or current.scheme,
+        target.netloc or current.netloc,
+        target.path,
+        urlencode(merged_params, doseq=True),
+        target.fragment,
+    ))
+    return ensure_required_search_filters(merged_url)
 
 
 def verify_search_filters_in_url(url: str) -> tuple[bool, list[str]]:
-    """Fail closed unless freshness and all configured salary filters remain."""
+    """Fail closed unless salary, freshness, and extra URL filters remain."""
     from urllib.parse import urlsplit, parse_qsl
+
     params = parse_qsl(urlsplit(url).query, keep_blank_values=True)
     param_map = {}
     for key, value in params:
         param_map.setdefault(key, []).append(value)
+
     problems = []
     if "1" not in param_map.get("jobAge", []):
         problems.append("jobAge=1 (Freshness: Last 1 day) is missing")
-    expected_salary = {"15to25", "25to50", "50to75", "75to100", "100to500", "501", "10to15"}
+
+    expected_salary = {
+        "15to25", "25to50", "50to75", "75to100",
+        "100to500", "501", "10to15",
+    }
     missing_salary = expected_salary - set(param_map.get("ctcFilter", []))
     if missing_salary:
         problems.append("salary filter(s) missing: " + ", ".join(sorted(missing_salary)))
+
+    expected_glbl_qcrc = {"1026", "1028", "1060"}
+    missing_glbl_qcrc = expected_glbl_qcrc - set(param_map.get("glbl_qcrc", []))
+    if missing_glbl_qcrc:
+        problems.append("glbl_qcrc filter(s) missing: " + ", ".join(sorted(missing_glbl_qcrc)))
+
+    if "4" not in param_map.get("experience", []):
+        problems.append("experience=4 is missing")
+    if "1" not in param_map.get("jobPostType", []):
+        problems.append("jobPostType=1 is missing")
+
     return not problems, problems
+
+
+def append_additional_url_filters(page):
+    """Ensure the initial results URL has all required filters, then navigate."""
+    current_url = page.url
+    updated_url = ensure_required_search_filters(current_url)
+
+    print("Navigating to results URL with all required filters:", flush=True)
+    print(updated_url, flush=True)
+    page.goto(updated_url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(1500)
+
+    filters_ok, problems = verify_search_filters_in_url(page.url)
+    if not filters_ok:
+        raise RuntimeError(
+            "Search filters could not be verified after navigation: "
+            + "; ".join(problems)
+        )
+
+    print("All required search filters verified.", flush=True)
+    print(f"Updated results URL: {page.url}", flush=True)
 
 
 def visible(locator):
@@ -621,6 +723,7 @@ def main():
             click_salary_view_more(page)
             select_salary_ranges(page)
             select_freshness_last_1_day(page)
+            append_additional_url_filters(page)
             first_page_setup_complete = True
             filters_ok, filter_problems = verify_search_filters_in_url(page.url)
             if not filters_ok:
