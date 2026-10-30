@@ -16,6 +16,7 @@ EXCLUDED_COMPANIES = {
     "cgi",
     "cognizant",
     "epam systems",
+    "accenture",
     "infosys bpm",
 }
 
