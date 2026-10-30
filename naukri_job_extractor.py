@@ -55,6 +55,76 @@ def filter_excluded_companies(jobs):
     return filtered_jobs
 
 
+def load_processed_job_urls(processed_path: Path) -> set[str]:
+    """Load previously processed Naukri job URLs; fail closed on a malformed workbook."""
+    from openpyxl import load_workbook
+
+    if not processed_path.exists():
+        print(
+            f"[PROCESSED-FILTER] {processed_path.name} does not exist yet; "
+            "no previously processed URLs to exclude.",
+            flush=True,
+        )
+        return set()
+
+    workbook = load_workbook(processed_path, read_only=True, data_only=True)
+    try:
+        sheet = workbook.active
+        headers = [
+            str(cell.value or "").strip().casefold()
+            for cell in sheet[1]
+        ]
+        try:
+            url_column = headers.index("job url") + 1
+        except ValueError as exc:
+            raise ValueError(
+                f"{processed_path.name} is missing the required 'Job URL' column. "
+                f"Found headers: {headers!r}"
+            ) from exc
+
+        urls = set()
+        for row_number in range(2, sheet.max_row + 1):
+            url = str(sheet.cell(row_number, url_column).value or "").strip()
+            if url:
+                urls.add(url)
+
+        print(
+            f"[PROCESSED-FILTER] Loaded {len(urls)} processed URL(s) "
+            f"from {processed_path.name}.",
+            flush=True,
+        )
+        return urls
+    finally:
+        workbook.close()
+
+
+def filter_already_processed_jobs(jobs, processed_urls: set[str]):
+    """Remove jobs whose original Naukri URL is already in the processed ledger."""
+    remaining = []
+    skipped = []
+
+    for job in jobs:
+        url = (job.get("url") or "").strip()
+        if url and url in processed_urls:
+            skipped.append(job)
+        else:
+            remaining.append(job)
+
+    print(
+        f"[PROCESSED-FILTER] Removed {len(skipped)} already-processed job(s); "
+        f"{len(remaining)} remain.",
+        flush=True,
+    )
+    for job in skipped:
+        print(
+            f"  Already processed: {job.get('company')} — {job.get('title')} — "
+            f"{job.get('url')}",
+            flush=True,
+        )
+
+    return remaining
+
+
 def scrape_first_page_jobs_to_excel(page, append: bool = False) -> list[str]:
     """
     Extract job cards from the current Naukri results page.
@@ -67,6 +137,7 @@ def scrape_first_page_jobs_to_excel(page, append: bool = False) -> list[str]:
     from openpyxl import load_workbook
 
     output_path = Path(__file__).resolve().parent / "naukri_job_list.xlsx"
+    processed_path = Path(__file__).resolve().parent / "processed_requests.xlsx"
     page_url = getattr(page, "url", "<unknown>")
 
     print(
@@ -94,12 +165,12 @@ def scrape_first_page_jobs_to_excel(page, append: bool = False) -> list[str]:
                 "%Y%m%d_%H%M%S"
             )
             html_path = (
-                output_path.parent
-                / f"naukri_scrape_failure_{stamp}.html"
+                    output_path.parent
+                    / f"naukri_scrape_failure_{stamp}.html"
             )
             png_path = (
-                output_path.parent
-                / f"naukri_scrape_failure_{stamp}.png"
+                    output_path.parent
+                    / f"naukri_scrape_failure_{stamp}.png"
             )
 
             html_path.write_text(page.content(), encoding="utf-8")
@@ -289,9 +360,15 @@ def scrape_first_page_jobs_to_excel(page, append: bool = False) -> list[str]:
     filtered_jobs = filter_excluded_companies(unique_jobs)
     excluded_count = extracted_count - len(filtered_jobs)
 
+    processed_urls = load_processed_job_urls(processed_path)
+    before_processed_filter = len(filtered_jobs)
+    filtered_jobs = filter_already_processed_jobs(filtered_jobs, processed_urls)
+    processed_count = before_processed_filter - len(filtered_jobs)
+
     print(
         f"[SCRAPE] Extracted={extracted_count}; "
         f"excluded_companies={excluded_count}; "
+        f"already_processed={processed_count}; "
         f"eligible_this_page={len(filtered_jobs)}",
         flush=True,
     )

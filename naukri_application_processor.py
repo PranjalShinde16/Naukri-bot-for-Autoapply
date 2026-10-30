@@ -31,6 +31,9 @@ MAIN_EXCEL = BASE_DIR / "naukri_job_list.xlsx"
 # Separate workbook for jobs that require applying on the company website.
 EXTERNAL_EXCEL = BASE_DIR / "naukri_external_applications.xlsx"
 
+# Permanent URL ledger used by the extractor to avoid processing jobs again.
+PROCESSED_REQUESTS_EXCEL = BASE_DIR / "processed_requests.xlsx"
+
 # Durable record of confirmed application outcomes whose Excel row cleanup failed.
 # This prevents the same confirmed application from being submitted again on a later run.
 CONFIRMED_OUTCOMES_FILE = BASE_DIR / "naukri_confirmed_outcomes.json"
@@ -73,7 +76,7 @@ def log(message: str) -> None:
     try:
         base_dir = globals().get("BASE_DIR", Path(__file__).resolve().parent)
         with (base_dir / "naukri_processor_debug.log").open(
-            "a", encoding="utf-8"
+                "a", encoding="utf-8"
         ) as log_file:
             log_file.write(line + "\n")
     except Exception:
@@ -108,8 +111,8 @@ def is_naukri_job_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
         return (
-            parsed.scheme in {"http", "https"}
-            and "naukri.com" in parsed.netloc.lower()
+                parsed.scheme in {"http", "https"}
+                and "naukri.com" in parsed.netloc.lower()
         )
     except Exception:
         return False
@@ -230,8 +233,8 @@ def _last_nonempty_row(worksheet) -> int:
     """Find the last row containing at least one actual cell value."""
     for row_number in range(worksheet.max_row, 1, -1):
         if any(
-            cell.value is not None and normalize_text(cell.value) != ""
-            for cell in worksheet[row_number]
+                cell.value is not None and normalize_text(cell.value) != ""
+                for cell in worksheet[row_number]
         ):
             return row_number
     return 1
@@ -523,11 +526,124 @@ def remove_job_from_main_excel(job_url: str) -> bool:
             except Exception:
                 pass
 
+def append_processed_request(
+        company: str,
+        title: str,
+        naukri_url: str,
+        processing_type: str,
+) -> bool:
+    """
+    Persist a job's Naukri URL after its processing outcome is confirmed.
+    The original Naukri URL is the deduplication key; external company URLs
+    remain in the separate external-applications workbook.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    naukri_url = normalize_text(naukri_url)
+    if not is_valid_http_url(naukri_url) or not is_naukri_job_url(naukri_url):
+        log(f"[PROCESSED-REQUESTS] Refusing invalid Naukri job URL: {naukri_url!r}")
+        return False
+
+    headers = [
+        "Company Name",
+        "Job Title",
+        "Job URL",
+        "Processing Type",
+        "Processed At",
+    ]
+    temporary_path = PROCESSED_REQUESTS_EXCEL.with_name(
+        f"{PROCESSED_REQUESTS_EXCEL.stem}_temporary{PROCESSED_REQUESTS_EXCEL.suffix}"
+    )
+    workbook = None
+
+    try:
+        if PROCESSED_REQUESTS_EXCEL.exists():
+            workbook = load_workbook(PROCESSED_REQUESTS_EXCEL)
+            worksheet = workbook.active
+            existing_headers = [normalize_text(cell.value) for cell in worksheet[1]]
+            if [h.lower() for h in existing_headers[:len(headers)]] != [h.lower() for h in headers]:
+                raise ValueError(
+                    f"Unexpected headers in {PROCESSED_REQUESTS_EXCEL.name}: "
+                    f"{existing_headers!r}"
+                )
+        else:
+            workbook = Workbook()
+            worksheet = workbook.active
+            worksheet.title = "Processed Requests"
+            worksheet.append(headers)
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="2457C5")
+                cell.alignment = Alignment(vertical="center")
+            worksheet.freeze_panes = "A2"
+            worksheet.column_dimensions["A"].width = 32
+            worksheet.column_dimensions["B"].width = 48
+            worksheet.column_dimensions["C"].width = 100
+            worksheet.column_dimensions["D"].width = 26
+            worksheet.column_dimensions["E"].width = 22
+
+        url_col = headers.index("Job URL") + 1
+        for row_number in range(2, worksheet.max_row + 1):
+            existing_url = normalize_text(worksheet.cell(row_number, url_col).value)
+            if existing_url == naukri_url:
+                log(
+                    "[PROCESSED-REQUESTS] URL already recorded; "
+                    f"not adding a duplicate: {naukri_url}"
+                )
+                workbook.close()
+                workbook = None
+                return True
+
+        new_row = worksheet.max_row + 1
+        values = [
+            normalize_text(company),
+            normalize_text(title),
+            naukri_url,
+            normalize_text(processing_type),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        for column, value in enumerate(values, start=1):
+            worksheet.cell(row=new_row, column=column, value=value)
+
+        url_cell = worksheet.cell(row=new_row, column=url_col)
+        url_cell.hyperlink = naukri_url
+        url_cell.style = "Hyperlink"
+
+        worksheet.auto_filter.ref = worksheet.dimensions
+        worksheet.row_dimensions[1].height = 24
+        workbook.save(temporary_path)
+        workbook.close()
+        workbook = None
+        temporary_path.replace(PROCESSED_REQUESTS_EXCEL)
+
+        log(
+            f"[PROCESSED-REQUESTS] Saved {processing_type}: "
+            f"{naukri_url} -> {PROCESSED_REQUESTS_EXCEL.name}"
+        )
+        return True
+
+    except Exception as exc:
+        log(f"[PROCESSED-REQUESTS] ERROR saving processed URL: {exc}")
+        return False
+    finally:
+        if workbook is not None:
+            try:
+                workbook.close()
+            except Exception:
+                pass
+        if temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except Exception:
+                pass
+
+
 def append_external_application(
-    company: str,
-    title: str,
-    naukri_url: str,
-    company_url: str,
+        company: str,
+        title: str,
+        naukri_url: str,
+        company_url: str,
 ) -> bool:
     """Save company name and external URL in a separate workbook.
 
@@ -645,8 +761,8 @@ def visible_text(page: Page) -> str:
 
 
 def find_visible_button(
-    page: Page,
-    pattern: re.Pattern,
+        page: Page,
+        pattern: re.Pattern,
 ):
     """
     Find a visible button or button-like element whose accessible
@@ -1062,9 +1178,9 @@ def find_external_apply_link(page: Page) -> Optional[str]:
         page.wait_for_timeout(1500)
         current_url = page.url
         if (
-            current_url != original_url
-            and is_valid_http_url(current_url)
-            and not is_naukri_job_url(current_url)
+                current_url != original_url
+                and is_valid_http_url(current_url)
+                and not is_naukri_job_url(current_url)
         ):
             log(f"Captured external application redirect URL: {current_url}")
             return current_url
@@ -1106,9 +1222,9 @@ def find_apply_button(page: Page):
                     text = normalize_text(element.inner_text())
 
                     if re.fullmatch(
-                        r"Apply(\s+now)?",
-                        text,
-                        flags=re.IGNORECASE,
+                            r"Apply(\s+now)?",
+                            text,
+                            flags=re.IGNORECASE,
                     ):
                         return element
 
@@ -1158,10 +1274,10 @@ def find_visible_application_panel(page: Page):
 
                 # A panel should contain application-related content.
                 if re.search(
-                    r"save|submit|response|resume|question|"
-                    r"application|thank you|relocat|notice period",
-                    text,
-                    re.IGNORECASE,
+                        r"save|submit|response|resume|question|"
+                        r"application|thank you|relocat|notice period",
+                        text,
+                        re.IGNORECASE,
                 ):
                     return panel
 
@@ -1217,9 +1333,9 @@ def find_save_button(page: Page, panel=None):
                 button_text = normalize_text(candidate.inner_text())
 
                 if re.fullmatch(
-                    r"Save",
-                    button_text,
-                    re.IGNORECASE,
+                        r"Save",
+                        button_text,
+                        re.IGNORECASE,
                 ):
                     return candidate
 
@@ -1389,8 +1505,8 @@ def confirmation_visible(page: Page) -> bool:
 
 
 def wait_for_manual_application_completion(
-    page: Page,
-    panel=None,
+        page: Page,
+        panel=None,
 ) -> bool:
     """
     Wait while the user completes the application manually.
@@ -1401,7 +1517,7 @@ def wait_for_manual_application_completion(
     Returns True only after the success phrase is detected.
     """
     deadline = time.time() + (
-        APPLICATION_TIMEOUT_MINUTES * 60
+            APPLICATION_TIMEOUT_MINUTES * 60
     )
 
     last_questions = None
@@ -1467,8 +1583,8 @@ def wait_for_manual_application_completion(
 # ============================================================
 
 def process_one_job(
-    context: BrowserContext,
-    job: dict,
+        context: BrowserContext,
+        job: dict,
 ) -> str:
     """
     Process one job in a new tab.
@@ -1746,6 +1862,7 @@ def main(job_urls: Optional[set[str]] = None, wait_for_enter: bool = True) -> No
     log(f"Project folder: {BASE_DIR}")
     log(f"Main Excel: {MAIN_EXCEL}")
     log(f"External applications Excel: {EXTERNAL_EXCEL}")
+    log(f"Processed requests Excel: {PROCESSED_REQUESTS_EXCEL}")
     log(f"Browser profile: {PROFILE_DIR}")
 
     if not MAIN_EXCEL.exists():
@@ -1845,12 +1962,53 @@ def main(job_urls: Optional[set[str]] = None, wait_for_enter: bool = True) -> No
                         f"({saved_outcome}) from a previous run. Retrying Excel cleanup "
                         "only; the application flow will not be opened again."
                     )
+                    processing_type = (
+                        "EXTERNAL_APPLICATION"
+                        if saved_outcome == "EXTERNAL_APPLICATION"
+                        else "NORMAL_APPLY"
+                    )
+                    processed_saved = append_processed_request(
+                        company=job.get("company", ""),
+                        title=job.get("title", ""),
+                        naukri_url=job["url"],
+                        processing_type=processing_type,
+                    )
+                    if not processed_saved:
+                        cleanup_failure_count += 1
+                        log(
+                            "WARNING: Confirmed outcome is in the recovery ledger, but "
+                            "processed_requests.xlsx could not be updated. Main Excel row "
+                            "will be retained for a safe retry."
+                        )
+                        continue
+
+                    processing_type = (
+                        "EXTERNAL_APPLICATION"
+                        if outcome == "EXTERNAL_APPLICATION"
+                        else "NORMAL_APPLY"
+                    )
+                    processed_saved = append_processed_request(
+                        company=job.get("company", ""),
+                        title=job.get("title", ""),
+                        naukri_url=job["url"],
+                        processing_type=processing_type,
+                    )
+                    if not processed_saved:
+                        cleanup_failure_count += 1
+                        log(
+                            "WARNING: Application outcome is confirmed and protected by "
+                            "the recovery ledger, but processed_requests.xlsx could not be "
+                            "updated. Main Excel row will be retained; no further application "
+                            "action will be taken for this URL on the next run."
+                        )
+                        continue
+
                     removed = remove_job_from_main_excel(job["url"])
                     if removed:
                         completed_count += 1
                         confirmed_outcomes.pop(job["url"], None)
                         save_confirmed_outcomes(confirmed_outcomes)
-                        log("SUCCESS: Previously confirmed application row cleanup is now verified.")
+                        log("SUCCESS: Processed URL recorded and main Excel cleanup verified.")
                     else:
                         cleanup_failure_count += 1
                         log("WARNING: Excel cleanup still failed. Confirmed outcome remains "
@@ -1942,6 +2100,7 @@ def main(job_urls: Optional[set[str]] = None, wait_for_enter: bool = True) -> No
             log(f"Jobs originally loaded: {len(jobs)}")
             log(f"Main Excel: {MAIN_EXCEL}")
             log(f"External applications Excel: {EXTERNAL_EXCEL}")
+            log(f"Processed requests Excel: {PROCESSED_REQUESTS_EXCEL}")
             log("=" * 70)
 
             if wait_for_enter:
