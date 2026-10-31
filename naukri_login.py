@@ -65,8 +65,8 @@ def ensure_required_search_filters(url: str) -> str:
     }
     params = [(key, value) for key, value in params if key not in managed_keys]
 
-    # Preserve all seven salary ranges and the Last 1 day freshness filter.
-    params.append(("jobAge", "1"))
+    # Preserve all seven salary ranges and the Last 3 day freshness filter.
+    params.append(("jobAge", "3"))
     for value in (
         "15to25",
         "25to50",
@@ -134,8 +134,8 @@ def verify_search_filters_in_url(url: str) -> tuple[bool, list[str]]:
         param_map.setdefault(key, []).append(value)
 
     problems = []
-    if "1" not in param_map.get("jobAge", []):
-        problems.append("jobAge=1 (Freshness: Last 1 day) is missing")
+    if "3" not in param_map.get("jobAge", []):
+        problems.append("jobAge=3 (Freshness: Last 3 day) is missing")
 
     expected_salary = {
         "15to25", "25to50", "50to75", "75to100",
@@ -224,9 +224,9 @@ def search_software(page):
         'input[placeholder="Enter keyword / designation / companies"]'
     )
     search_input.wait_for(state="visible", timeout=10000)
-    search_input.fill("software")
+    search_input.fill("Java, Spring Boot, ")
 
-    print("Entered keyword: software", flush=True)
+    print("Entered keyword: Java, Spring Boot, ", flush=True)
 
     page.get_by_role("button", name="Search", exact=True).click()
     print("Search submitted.", flush=True)
@@ -400,10 +400,10 @@ def save_freshness_diagnostics(page):
       });
       const all = [...document.querySelectorAll('body *')];
       const exactFreshness = all.filter(e => e.children.length === 0 && (e.textContent || '').trim() === 'Freshness');
-      const exactLastDay = all.filter(e => e.children.length === 0 && (e.textContent || '').trim() === 'Last 1 day');
+      const exactLastDay = all.filter(e => e.children.length === 0 && (e.textContent || '').trim() === 'Last 3 days');
       const related = all.filter(e => {
         const t = (e.innerText || '').trim();
-        return t && t.length < 250 && /freshness|last 1 day/i.test(t);
+        return t && t.length < 250 && /freshness|last 3 days/i.test(t);
       });
       const ancestry = (els) => els.map(el => {
         const chain = []; let n = el;
@@ -447,7 +447,7 @@ def save_freshness_diagnostics(page):
 
 
 def select_freshness_last_1_day(page):
-    """Select Last 1 day through the Freshness dropdown's DOM controls.
+    """Select Last 3 day through the Freshness dropdown's DOM controls.
 
     This intentionally avoids Playwright's viewport/visibility click checks:
     Naukri's menu item can be present and enabled in the DOM while positioned
@@ -478,7 +478,7 @@ def select_freshness_last_1_day(page):
                style.visibility !== 'hidden' && style.display !== 'none';
     }""", timeout=5000)
 
-    option = menu.locator('a[data-id="filter-freshness-1"]')
+    option = menu.locator('a[data-id="filter-freshness-3"]')
     option.wait_for(state="attached", timeout=5000)
 
     # Validate the exact option exists and is enabled, then dispatch its native
@@ -495,16 +495,16 @@ def select_freshness_last_1_day(page):
         })()
     })""")
 
-    if option_state["text"] != "Last 1 day":
+    if option_state["text"] != "Last 3 days":
         raise RuntimeError(
             f"Unexpected Freshness option text: {option_state['text']!r}"
         )
     if option_state["disabled"]:
-        raise RuntimeError("Freshness option 'Last 1 day' is disabled in the DOM.")
+        raise RuntimeError("Freshness option 'Last 3 days' is disabled in the DOM.")
     if not option_state["menuVisible"]:
         raise RuntimeError("Freshness menu did not open in the DOM.")
 
-    print("Selecting Freshness: Last 1 day via DOM click...", flush=True)
+    print("Selecting Freshness: Last 3 days via DOM click...", flush=True)
     option.evaluate("el => el.click()")
 
     # Wait for the dropdown's selected label or the site URL to update.
@@ -512,7 +512,7 @@ def select_freshness_last_1_day(page):
         page.wait_for_function("""() => {
             const button = document.querySelector('#filter-freshness');
             const label = button ? (button.innerText || button.textContent || '').trim() : '';
-            return label === 'Last 1 day' || /(?:jobAge|freshness|job-age|jobAgeFilter)[^&]*1/i.test(location.href);
+            return label === 'Last 3 days' || /(?:jobAge|freshness|job-age|jobAgeFilter)[^&]*3/i.test(location.href);
         }""", timeout=10000)
     except PlaywrightTimeoutError:
         pass
@@ -522,9 +522,9 @@ def select_freshness_last_1_day(page):
     print(f"Results URL after freshness selection: {page.url}", flush=True)
 
     url_has_freshness = bool(
-        re.search(r"(?:jobAge|freshness|job-age|jobAgeFilter)[^&]*1", page.url, re.I)
+        re.search(r"(?:jobAge|freshness|job-age|jobAgeFilter)[^&]*3", page.url, re.I)
     )
-    if selected_text != "Last 1 day" and not url_has_freshness:
+    if selected_text != "Last 3 days" and not url_has_freshness:
         raise RuntimeError(
             "The DOM click was dispatched, but the Freshness selection could not "
             "be confirmed from the dropdown label or URL. The browser remains open."

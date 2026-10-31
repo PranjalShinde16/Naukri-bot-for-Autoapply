@@ -6,9 +6,9 @@ A Python automation workflow that searches Naukri for software jobs, applies con
 
 - Opens Naukri using a persistent Playwright browser profile.
 - Reuses an existing login session where available; if login is required, it can use credentials from a local `.env` file and pause for CAPTCHA/OTP completion.
-- Searches for the keyword **`software`**.
+- Searches for the keyword **`Java, Spring Boot, `**.
 - Applies the configured search filters:
-  - Freshness: **Last 1 day**
+  - Freshness: **Last 3 day**
   - Salary ranges: **10–15 Lakhs**, **15–25 Lakhs**, **25–50 Lakhs**, **50–75 Lakhs**, **75–100 Lakhs**, **1–5 Cr**, and **5+ Cr**
   - Additional URL filters: `glbl_qcrc=1026`, `glbl_qcrc=1028`, `glbl_qcrc=1060`, `experience=4`, and `jobPostType=1`
 - Verifies required filter parameters on result-page URLs and preserves them while paginating.
