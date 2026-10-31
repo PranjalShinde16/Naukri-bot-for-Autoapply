@@ -526,6 +526,41 @@ def remove_job_from_main_excel(job_url: str) -> bool:
             except Exception:
                 pass
 
+def is_job_url_already_processed(naukri_url: str) -> bool:
+    """Return True when the original Naukri URL already exists in the ledger."""
+    naukri_url = normalize_text(naukri_url)
+    if not naukri_url or not PROCESSED_REQUESTS_EXCEL.exists():
+        return False
+
+    workbook = None
+    try:
+        workbook = load_workbook(PROCESSED_REQUESTS_EXCEL, read_only=True, data_only=True)
+        worksheet = workbook.active
+        headers = [normalize_text(cell.value).lower() for cell in worksheet[1]]
+        try:
+            url_col = headers.index("job url") + 1
+        except ValueError:
+            log(
+                "[PROCESSED-REQUESTS] WARNING: 'Job URL' column was not found; "
+                "cannot safely check whether this URL was processed."
+            )
+            return False
+
+        for row in worksheet.iter_rows(min_row=2, min_col=url_col, max_col=url_col, values_only=True):
+            if normalize_text(row[0]) == naukri_url:
+                return True
+        return False
+    except Exception as exc:
+        log(f"[PROCESSED-REQUESTS] ERROR checking processed URL: {exc}")
+        return False
+    finally:
+        if workbook is not None:
+            try:
+                workbook.close()
+            except Exception:
+                pass
+
+
 def append_processed_request(
         company: str,
         title: str,
@@ -1959,47 +1994,22 @@ def main(job_urls: Optional[set[str]] = None, wait_for_enter: bool = True) -> No
                 if saved_outcome:
                     log(
                         "This URL already has a confirmed application outcome "
-                        f"({saved_outcome}) from a previous run. Retrying Excel cleanup "
-                        "only; the application flow will not be opened again."
+                        f"({saved_outcome}) from a previous run. Retrying processed-ledger "
+                        "recording and Excel cleanup only; the application flow will not run again."
                     )
-                    processing_type = (
-                        "EXTERNAL_APPLICATION"
-                        if saved_outcome == "EXTERNAL_APPLICATION"
-                        else "NORMAL_APPLY"
-                    )
-                    processed_saved = append_processed_request(
-                        company=job.get("company", ""),
-                        title=job.get("title", ""),
-                        naukri_url=job["url"],
-                        processing_type=processing_type,
-                    )
-                    if not processed_saved:
-                        cleanup_failure_count += 1
-                        log(
-                            "WARNING: Confirmed outcome is in the recovery ledger, but "
-                            "processed_requests.xlsx could not be updated. Main Excel row "
-                            "will be retained for a safe retry."
-                        )
-                        continue
 
-                    processing_type = (
-                        "EXTERNAL_APPLICATION"
-                        if outcome == "EXTERNAL_APPLICATION"
-                        else "NORMAL_APPLY"
-                    )
                     processed_saved = append_processed_request(
                         company=job.get("company", ""),
                         title=job.get("title", ""),
                         naukri_url=job["url"],
-                        processing_type=processing_type,
+                        processing_type=saved_outcome,
                     )
+
                     if not processed_saved:
                         cleanup_failure_count += 1
                         log(
-                            "WARNING: Application outcome is confirmed and protected by "
-                            "the recovery ledger, but processed_requests.xlsx could not be "
-                            "updated. Main Excel row will be retained; no further application "
-                            "action will be taken for this URL on the next run."
+                            "WARNING: Could not save the confirmed URL to "
+                            "processed_requests.xlsx. The main Excel row is being retained."
                         )
                         continue
 
@@ -2008,28 +2018,69 @@ def main(job_urls: Optional[set[str]] = None, wait_for_enter: bool = True) -> No
                         completed_count += 1
                         confirmed_outcomes.pop(job["url"], None)
                         save_confirmed_outcomes(confirmed_outcomes)
-                        log("SUCCESS: Processed URL recorded and main Excel cleanup verified.")
+                        log(
+                            "SUCCESS: Processed URL recorded and main Excel cleanup verified."
+                        )
                     else:
                         cleanup_failure_count += 1
-                        log("WARNING: Excel cleanup still failed. Confirmed outcome remains "
-                            "in the ledger for a cleanup-only retry on the next run.")
+                        log(
+                            "WARNING: Processed URL was recorded, but main Excel cleanup "
+                            "failed. The confirmed outcome remains available for recovery."
+                        )
+                    continue
+
+                # A URL may already be recorded even if an earlier run failed while
+                # removing its row from the main workbook. Never submit it again.
+                if is_job_url_already_processed(job["url"]):
+                    log(
+                        "This Naukri URL is already present in processed_requests.xlsx. "
+                        "Skipping application and retrying main Excel cleanup only."
+                    )
+                    removed = remove_job_from_main_excel(job["url"])
+                    if removed:
+                        completed_count += 1
+                        log("SUCCESS: Existing processed URL confirmed; main Excel row removed.")
+                    else:
+                        cleanup_failure_count += 1
+                        log(
+                            "WARNING: URL is already recorded as processed, but its row "
+                            "could not be removed from the main Excel."
+                        )
                     continue
 
                 outcome = process_one_job(context, job)
 
                 if outcome == "KEYSKILLS_NOT_GREEN":
                     keyskills_skipped_count += 1
+
+                    # Record skipped URLs too, otherwise the extractor will pick them
+                    # up again on the next run.
+                    processed_saved = append_processed_request(
+                        company=job.get("company", ""),
+                        title=job.get("title", ""),
+                        naukri_url=job["url"],
+                        processing_type="KEYSKILLS_NOT_GREEN",
+                    )
+
+                    if not processed_saved:
+                        keyskills_skip_cleanup_failures += 1
+                        log(
+                            "WARNING: Could not save this skipped URL to "
+                            "processed_requests.xlsx. Keeping the job in the main Excel."
+                        )
+                        continue
+
                     removed = remove_job_from_main_excel(job["url"])
                     if removed:
                         log(
-                            "SKIPPED: Keyskills was not green. Job row removed from the main Excel; "
-                            "no application was submitted and no external URL was saved."
+                            "SKIPPED: Keyskills was not green. URL recorded in "
+                            "processed_requests.xlsx and main Excel row removed."
                         )
                     else:
                         keyskills_skip_cleanup_failures += 1
                         log(
-                            "WARNING: Keyskills was not green, so no application was submitted, "
-                            "but removing the job row from Excel failed. It remains for cleanup."
+                            "WARNING: Keyskills was not green and its URL was recorded, "
+                            "but removing the main Excel row failed."
                         )
                     time.sleep(1.5)
                     continue
@@ -2039,41 +2090,59 @@ def main(job_urls: Optional[set[str]] = None, wait_for_enter: bool = True) -> No
                     "APPLIED_ALREADY",
                     "APPLICATION_COMPLETED",
                 }:
-                    # For external applications, the separate workbook is saved
-                    # inside process_one_job before this removal is attempted.
                     if outcome == "EXTERNAL_APPLICATION":
                         external_saved_count += 1
                         log("External application URL was saved to the separate workbook.")
                     else:
                         log(f"Application outcome confirmed: {outcome}")
 
-                    # Persist the confirmed outcome before touching the main workbook.
-                    # If cleanup fails or the process stops, the next run retries cleanup
-                    # only instead of submitting the application a second time.
+                    # Persist recovery information first. This ensures that if the
+                    # process stops during Excel cleanup, the application is not repeated.
                     confirmed_outcomes[job["url"]] = outcome
-                    ledger_saved = save_confirmed_outcomes(confirmed_outcomes)
-                    if not ledger_saved:
+                    recovery_saved = save_confirmed_outcomes(confirmed_outcomes)
+                    if not recovery_saved:
                         log(
-                            "WARNING: Could not persist the confirmed-outcome ledger. "
-                            "Excel cleanup will still be attempted, but duplicate-application "
-                            "protection cannot be guaranteed if cleanup also fails."
+                            "WARNING: Could not save the confirmed-outcome recovery file. "
+                            "The processed-requests workbook will be used as the second "
+                            "durable record."
                         )
+
+                    # Always persist the original Naukri URL, not an external URL.
+                    processed_saved = append_processed_request(
+                        company=job.get("company", ""),
+                        title=job.get("title", ""),
+                        naukri_url=job["url"],
+                        processing_type=outcome,
+                    )
+
+                    if not processed_saved:
+                        cleanup_failure_count += 1
+                        log(
+                            "WARNING: Could not save the processed URL. The main Excel row "
+                            "will be retained, and the confirmed-outcome recovery file "
+                            "will prevent this application from being submitted again."
+                        )
+                        continue
 
                     removed = remove_job_from_main_excel(job["url"])
                     if removed:
                         completed_count += 1
                         confirmed_outcomes.pop(job["url"], None)
-                        save_confirmed_outcomes(confirmed_outcomes)
+                        if not save_confirmed_outcomes(confirmed_outcomes):
+                            log(
+                                "WARNING: Could not clear the recovery file after cleanup. "
+                                "The next run will safely retry cleanup only."
+                            )
                         log(
-                            "SUCCESS: Application outcome confirmed and main Excel "
-                            "row cleanup verified."
+                            "SUCCESS: Application outcome confirmed, processed URL saved, "
+                            "and main Excel row cleanup verified."
                         )
                     else:
                         cleanup_failure_count += 1
                         log(
-                            "WARNING: Application outcome is confirmed, but Excel cleanup "
-                            "failed. This remains an application success; the URL is recorded "
-                            "for cleanup-only retry and will not be applied again."
+                            "WARNING: Application outcome is confirmed and the processed "
+                            "URL is saved, but main Excel cleanup failed. The next run "
+                            "will retry cleanup without submitting the application again."
                         )
 
                 else:
